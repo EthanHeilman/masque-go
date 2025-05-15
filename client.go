@@ -29,6 +29,8 @@ type Client struct {
 
 	// QUICConfig is the QUIC config used when dialing the QUIC connection.
 	QUICConfig *quic.Config
+	// Headers can be set to specify additional HTTP headers in the Extended CONNECT
+	Headers http.Header
 
 	dialOnce   sync.Once
 	dialErr    error
@@ -51,11 +53,17 @@ func (c *Client) DialAddr(ctx context.Context, proxyTemplate *uritemplate.Templa
 	if err != nil {
 		return nil, nil, fmt.Errorf("masque: failed to expand Template: %w", err)
 	}
-	return c.dial(ctx, str)
+	return c.dial(ctx, nil, str)
 }
 
 // Dial dials a proxied connection to a target server.
 func (c *Client) Dial(ctx context.Context, proxyTemplate *uritemplate.Template, raddr *net.UDPAddr) (net.PacketConn, *http.Response, error) {
+	return c.DialWithConn(ctx, nil, proxyTemplate, raddr)
+}
+
+// Dial dials a proxied connection to a target server. If a quic.Connection is provided, it will use that connection rather than creating a new one.
+// This quic.Connection is useful for substituting a userland network stack.
+func (c *Client) DialWithConn(ctx context.Context, conn quic.Connection, proxyTemplate *uritemplate.Template, raddr *net.UDPAddr) (net.PacketConn, *http.Response, error) {
 	str, err := proxyTemplate.Expand(uritemplate.Values{
 		uriTemplateTargetHost: uritemplate.String(escape(raddr.IP.String())),
 		uriTemplateTargetPort: uritemplate.String(strconv.Itoa(raddr.Port)),
@@ -63,35 +71,37 @@ func (c *Client) Dial(ctx context.Context, proxyTemplate *uritemplate.Template, 
 	if err != nil {
 		return nil, nil, fmt.Errorf("masque: failed to expand Template: %w", err)
 	}
-	return c.dial(ctx, str)
+	return c.dial(ctx, conn, str)
 }
 
-func (c *Client) dial(ctx context.Context, expandedTemplate string) (net.PacketConn, *http.Response, error) {
+func (c *Client) dial(ctx context.Context, conn quic.Connection, expandedTemplate string) (net.PacketConn, *http.Response, error) {
 	u, err := url.Parse(expandedTemplate)
 	if err != nil {
 		return nil, nil, fmt.Errorf("masque: failed to parse URI: %w", err)
 	}
 
 	c.dialOnce.Do(func() {
-		quicConf := c.QUICConfig
-		if quicConf == nil {
-			quicConf = &quic.Config{
-				EnableDatagrams:   true,
-				InitialPacketSize: defaultInitialPacketSize,
+		if conn == nil {
+			quicConf := c.QUICConfig
+			if quicConf == nil {
+				quicConf = &quic.Config{
+					EnableDatagrams:   true,
+					InitialPacketSize: defaultInitialPacketSize,
+				}
 			}
-		}
-		if !quicConf.EnableDatagrams {
-			c.dialErr = errors.New("masque: QUICConfig needs to enable Datagrams")
-			return
-		}
-		tlsConf := c.TLSClientConfig
-		if tlsConf == nil {
-			tlsConf = &tls.Config{NextProtos: []string{http3.NextProtoH3}}
-		}
-		conn, err := quic.DialAddr(ctx, u.Host, tlsConf, quicConf)
-		if err != nil {
-			c.dialErr = fmt.Errorf("masque: dialing QUIC connection failed: %w", err)
-			return
+			if !quicConf.EnableDatagrams {
+				c.dialErr = errors.New("masque: QUICConfig needs to enable Datagrams")
+				return
+			}
+			tlsConf := c.TLSClientConfig
+			if tlsConf == nil {
+				tlsConf = &tls.Config{NextProtos: []string{http3.NextProtoH3}}
+			}
+			conn, err = quic.DialAddr(ctx, u.Host, tlsConf, quicConf)
+			if err != nil {
+				c.dialErr = fmt.Errorf("masque: dialing QUIC connection failed: %w", err)
+				return
+			}
 		}
 		c.conn = conn
 		tr := &http3.Transport{EnableDatagrams: true}
@@ -119,11 +129,17 @@ func (c *Client) dial(ctx context.Context, expandedTemplate string) (net.PacketC
 	if err != nil {
 		return nil, nil, fmt.Errorf("masque: failed to open request stream: %w", err)
 	}
+
+	if c.Headers == nil {
+		c.Headers = http.Header{}
+	}
+	c.Headers[http3.CapsuleProtocolHeader] = []string{capsuleProtocolHeaderValue}
+
 	if err := rstr.SendRequestHeader(&http.Request{
 		Method: http.MethodConnect,
 		Proto:  requestProtocol,
 		Host:   u.Host,
-		Header: http.Header{http3.CapsuleProtocolHeader: []string{capsuleProtocolHeaderValue}},
+		Header: c.Headers,
 		URL:    u,
 	}); err != nil {
 		return nil, nil, fmt.Errorf("masque: failed to send request: %w", err)
